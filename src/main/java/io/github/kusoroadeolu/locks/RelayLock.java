@@ -14,11 +14,11 @@ class Pad0 {
 class ValueField extends Pad0 {
     int value;
 
-    static final VarHandle STATE;
+    static final VarHandle VALUE;
 
     static {
         try {
-            STATE = MethodHandles.lookup().findVarHandle(ValueField.class, "value", int.class);
+            VALUE = MethodHandles.lookup().findVarHandle(ValueField.class, "value", int.class);
         }catch (Exception e) {
             throw new RuntimeException(e);
         }
@@ -37,7 +37,7 @@ class Pad1 extends ValueField {
 * by relaying wake-ups far earlier than they should occur.
 *
 * In a ticket lock, threads atomically claim tickets and wait on
-* a current serving ticket , until it equals their ticket before entering
+* a current serving field, until it equals their ticket before entering
 * some critical section. Here we augment it with a waiting queue/array to
 * so threads spin on some slot that corresponds to their ticket to improve locality
 * and a concurrent map to allow relayed unparks. Threads in the waiting queue
@@ -56,8 +56,8 @@ class Pad1 extends ValueField {
 * 1. The length of the critical section
 * 2. The max number of spinning waiters
 *
-* If the (time taken to exec the critical section * number of waiters)
-* is less than the time for the cpu to schedule a thread back onto
+* If the (time taken to exec the critical section * number of spinning waiters)
+* is less than the time for the os to schedule a thread back onto
 * the cpu, the relay trick doesn't help much here.
 *
 * My hypothesis going into this is that this should have around 1.5x to 2x less mean latency than a
@@ -66,8 +66,8 @@ class Pad1 extends ValueField {
 * */
 public class RelayLock implements FairLock {
 
-    private final AtomicInt currentSequence;
-    private final Sequence sequence;
+    private final AtomicInt nowServing;
+    private final Ticket ticket;
     private final ConcurrentMap<Integer, Thread> waitMap;
     private final Slot[] waitQueue;
     private final int mask;
@@ -78,9 +78,9 @@ public class RelayLock implements FairLock {
     public RelayLock() {
         int queueLen = Math.max(1, NCPU / 2);
         waitQueue = new Slot[queueLen];
-        waitMap = new ConcurrentHashMap<>(NCPU - queueLen);
-        sequence = new Sequence();
-        currentSequence = new AtomicInt();
+        waitMap = new ConcurrentHashMap<>(NCPU / 2);
+        ticket = new Ticket();
+        nowServing = new AtomicInt();
         mask = queueLen - 1;
 
         VarHandle.releaseFence();
@@ -91,13 +91,13 @@ public class RelayLock implements FairLock {
         VarHandle.fullFence();
     }
 
-    static class Sequence extends Pad1 {
-        public int nextSequence() {
-            return (int) STATE.getAndAdd(this, 1);
+    static class Ticket extends Pad1 {
+        public int nextTicket() {
+            return (int) VALUE.getAndAdd(this, 1);
         }
 
         public int get() {
-            return (int) STATE.getVolatile(this);
+            return (int) VALUE.getVolatile(this);
         }
     }
 
@@ -106,55 +106,58 @@ public class RelayLock implements FairLock {
         static final int NEXT = 1;
 
         public boolean isNext() {
-            return (int) STATE.getAcquire(this) == NEXT;
+            return (int) VALUE.getAcquire(this) == NEXT;
         }
 
         public void clearState() {
-            STATE.set(this, 0);
+            VALUE.set(this, 0);
         }
 
         public void signal() {
-            STATE.setRelease(this, NEXT);
+            VALUE.setRelease(this, NEXT);
         }
     }
 
     static class AtomicInt extends Pad1 {
         public int get() {
-            return (int) STATE.getVolatile(this);
+            return (int) VALUE.getVolatile(this);
         }
 
         public void set(int newState) {
-            STATE.setVolatile(this, newState);
+            VALUE.setVolatile(this, newState);
         }
 
         public int getPlain() {
-            return (int) STATE.get(this);
+            return (int) VALUE.get(this);
         }
     }
 
     @Override
     public void lock() {
-        int seq = sequence.nextSequence();
+        int ourTicket = ticket.nextTicket();
         var waitQueue = this.waitQueue;
+        int mask = this.mask;
+        var waitMap = this.waitMap;
+
         int len = mask + 1;
         boolean inMap = false;
         for (;;) {
-            int currSeq = currentSequence.get();
-            if ((seq - currSeq) < len) {
+            int nowServing = this.nowServing.get();
+            if ((ourTicket - nowServing) < len) {
 
                 if (inMap)
-                    waitMap.remove(seq);
+                    waitMap.remove(ourTicket);
 
-                int index = seq & mask;
+                int index = ourTicket & mask;
                 Slot s = waitQueue[index];
                 awaitTurn(s);
                 s.clearState();
                 return;
+
             }else {
                 //check if we can acquire, enqueue, check if we can acquire, then park
-                //remove on unpark
                 if (!inMap) {
-                    waitMap.put(seq, Thread.currentThread());
+                    waitMap.put(ourTicket, Thread.currentThread());
                     inMap = true;
                 } else {
                     LockSupport.park();
@@ -167,16 +170,16 @@ public class RelayLock implements FairLock {
 
     @Override
     public void unlock() {
-        var seq = currentSequence.getPlain(); //our ticket
+        var ourTicket = nowServing.getPlain(); //our ticket
         var waitQueue = this.waitQueue;
-        var nextSeq = seq + 1;
-        Slot next = waitQueue[nextSeq & mask];
-        currentSequence.set(nextSeq);
+        var nextTicket = ourTicket + 1;
+        Slot next = waitQueue[nextTicket & mask];
+        nowServing.set(nextTicket);
         next.signal(); //handoff to next waiter
 
-        int waiters = sequence.get() - seq;
+        int waiters = ticket.get() - ourTicket;
         if (waiters > (mask + 1)) {
-            int lookahead = seq + (mask + 1);
+            int lookahead = ourTicket + (mask + 1);
             Thread waiter = waitMap.get(lookahead); //ties the ordering
             //lookahead the length of the queue to signal a farther waiter
             LockSupport.unpark(waiter);
@@ -184,7 +187,7 @@ public class RelayLock implements FairLock {
 
     }
 
-    void awaitTurn(Slot s) {
+    static void awaitTurn(Slot s) {
         for (int i = 0; !s.isNext();) {
             if (i < SPINS_PER_YIELD) {
                 Thread.onSpinWait();
@@ -196,8 +199,169 @@ public class RelayLock implements FairLock {
         }
     }
 
-
     static int roundToPowerOfTwo(final int value) {
         return Math.max(1, 1 << (32 - Integer.numberOfLeadingZeros(value - 1)));
     }
+
+
+    static class WaitList {
+        final Node head;
+        final static Object DUMMY = new Object();
+
+        WaitList() {
+            this.head = new Node(0, null);
+        }
+
+        //null -> marked, dummy -> dumy
+        public void enqueue(int ticket) {
+            Node node = new Node(ticket, Thread.currentThread());
+            Node h = head;
+            outer: for (;;) {
+
+                VarHandle.acquireFence();
+                Node pred = h;
+                Node curr = h.next;
+
+                for (;;) {
+                    if (curr != null) {
+                        if (curr.isDummy()) continue outer;
+
+                        if (curr.isMarked()) {
+                            curr = helpUnlink(pred, curr);
+                            continue;
+                        }
+                    }
+
+                   boolean enqueue = curr == null || curr.ticket > ticket;
+
+                   if (enqueue) {
+
+                       node.next = curr;
+                       if (pred.casNext(curr, node)) return;
+                       else curr = pred.next;
+                       //pred.next would be made visible by acquire barrier emitted on failed cas
+                       continue;
+                   }
+
+                   pred = curr; curr = pred.next;
+                }
+            }
+        }
+
+        //should always be present
+        public void remove(int ticket) {
+            Node h = head;
+            outer: for (;;) {
+
+                VarHandle.acquireFence();
+                Node pred = h;
+                Node curr = h.next;
+
+                for (;;) {
+                    if (curr != null) {
+                        if (curr.isDummy()) continue outer;
+
+                        if (curr.isMarked()) {
+                            curr = helpUnlink(pred, curr);
+                            continue;
+                        }
+                    }
+
+                    boolean remove = curr != null && ticket == curr.ticket;
+
+                    if (remove) {
+                        curr.waiter = null;
+                        helpUnlink(pred, curr);
+                        return;
+                    }
+
+                    pred = curr; curr = pred.next;
+                }
+            }
+        }
+
+
+        public Thread get(int ticket) {
+            VarHandle.acquireFence();
+            Node node = head.next;
+
+            for (;;) {
+                if (node == null || node.ticket > ticket) return null;
+
+                if (node.isDummy()) {
+                    node = node.next;
+                    continue;
+                }
+
+                if (ticket == node.ticket)
+                    return (Thread) node.waiter;
+
+
+                node = node.next;
+            }
+        }
+
+        Node helpUnlink(Node pred, Node curr) {
+            Node dummy = new Node(0, DUMMY);
+            Node next;
+            for (;;) {
+                next = curr.next;
+
+                if (next != null && next.isDummy()) {
+                    next = next.next; //get the dummy's next ptr
+                    break;
+                }
+
+                dummy.next = next;
+                if (curr.casNext(next, dummy)) break;
+            }
+
+            pred.casNext(curr, next);
+            return next;
+        }
+
+
+        static class Node {
+            final int ticket;
+            Object waiter;
+            Node next;
+
+            public Node(int ticket, Object waiter) {
+                this.ticket = ticket;
+                this.waiter = waiter;
+            }
+
+            public Node(int ticket, Object waiter, Node next) {
+                this.ticket = ticket;
+                this.waiter = waiter;
+                this.next = next;
+            }
+
+
+            public boolean isMarked() {
+                return waiter == null;
+            }
+
+            public boolean casNext(Node from, Node to) {
+                return NEXT.compareAndSet(this, from, to);
+            }
+
+            public boolean isDummy() {
+                return waiter == DUMMY;
+            }
+        }
+
+
+        static final VarHandle NEXT;
+
+        static {
+            try {
+                NEXT = MethodHandles.lookup().findVarHandle(Node.class, "next", Node.class);
+            }catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+    }
+
 }

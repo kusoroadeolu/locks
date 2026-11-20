@@ -2,8 +2,6 @@ package io.github.kusoroadeolu.locks;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.LockSupport;
 
 class Pad0 {
@@ -40,17 +38,13 @@ class Pad1 extends ValueField {
 * a current serving field, until it equals their ticket before entering
 * some critical section. Here we augment it with a waiting queue/array to
 * so threads spin on some slot that corresponds to their ticket to improve locality
-* and a concurrent map to allow relayed unparks. Threads in the waiting queue
+* and a linked wait list to allow relayed unparks. Threads in the waiting queue
 * never park, however they spin briefly, periodically yielding their CPU time.
-* Threads that go in the concurrent map however park immediately.
+* Threads that go in the wait list however park immediately.
 *
 * The main idea here is when a thread releases the lock, and there are parked threads
 * it can look ahead and wakeup a parked thread farther into the queue.
 * So by the time its turn arrives, it'd already be running on the CPU.
-*
-* The core algorithm is actually quite simple, however it requires a
-* concurrent hashmap. A skip list map can work too, though lookups would
-* shift from O(1) to O(log(n)).
 *
 * The effectiveness of the relay trick does depend on 2 things
 * 1. The length of the critical section
@@ -68,7 +62,7 @@ public class RelayLock implements FairLock {
 
     private final AtomicInt nowServing;
     private final Ticket ticket;
-    private final ConcurrentMap<Integer, Thread> waitMap;
+    private final WaitList waitList;
     private final Slot[] waitQueue;
     private final int mask;
     private static final int NCPU = roundToPowerOfTwo(Runtime.getRuntime().availableProcessors());
@@ -78,7 +72,7 @@ public class RelayLock implements FairLock {
     public RelayLock() {
         int queueLen = Math.max(1, NCPU / 2);
         waitQueue = new Slot[queueLen];
-        waitMap = new ConcurrentHashMap<>(NCPU / 2);
+        waitList = new WaitList();
         ticket = new Ticket();
         nowServing = new AtomicInt();
         mask = queueLen - 1;
@@ -137,7 +131,7 @@ public class RelayLock implements FairLock {
         int ourTicket = ticket.nextTicket();
         var waitQueue = this.waitQueue;
         int mask = this.mask;
-        var waitMap = this.waitMap;
+        var waitList = this.waitList;
 
         int len = mask + 1;
         boolean inMap = false;
@@ -146,7 +140,7 @@ public class RelayLock implements FairLock {
             if ((ourTicket - nowServing) < len) {
 
                 if (inMap)
-                    waitMap.remove(ourTicket);
+                    waitList.remove(ourTicket);
 
                 int index = ourTicket & mask;
                 Slot s = waitQueue[index];
@@ -157,7 +151,7 @@ public class RelayLock implements FairLock {
             }else {
                 //check if we can acquire, enqueue, check if we can acquire, then park
                 if (!inMap) {
-                    waitMap.put(ourTicket, Thread.currentThread());
+                    waitList.enqueue(ourTicket);
                     inMap = true;
                 } else {
                     LockSupport.park();
@@ -180,7 +174,7 @@ public class RelayLock implements FairLock {
         int waiters = ticket.get() - ourTicket;
         if (waiters > (mask + 1)) {
             int lookahead = ourTicket + (mask + 1);
-            Thread waiter = waitMap.get(lookahead); //ties the ordering
+            Thread waiter = waitList.get(lookahead); //ties the ordering
             //lookahead the length of the queue to signal a farther waiter
             LockSupport.unpark(waiter);
         }
@@ -204,6 +198,9 @@ public class RelayLock implements FairLock {
     }
 
 
+    //GC Based variant of the harris micheal linked list
+    //Uses fence hoisting to allow plain traversals as the fence synchronizes
+    //with volatile cas's that happen before the fence
     static class WaitList {
         final Node head;
         final static Object DUMMY = new Object();
@@ -303,21 +300,20 @@ public class RelayLock implements FairLock {
 
         Node helpUnlink(Node pred, Node curr) {
             Node dummy = new Node(0, DUMMY);
-            Node next;
+            Node n;
             for (;;) {
-                next = curr.next;
+                n = curr.next;
+                dummy.next = n;
 
-                if (next != null && next.isDummy()) {
-                    next = next.next; //get the dummy's next ptr
+                if (n != null && n.isDummy()) {
+                    n = n.next; //get the dummy's next ptr
                     break;
-                }
-
-                dummy.next = next;
-                if (curr.casNext(next, dummy)) break;
+                } else if (curr.casNext(n, dummy))
+                    break; //emits an acquire fence, allows later reads to synchronize with this
             }
 
-            pred.casNext(curr, next);
-            return next;
+            pred.casNext(curr, n);
+            return n;
         }
 
 
@@ -330,13 +326,6 @@ public class RelayLock implements FairLock {
                 this.ticket = ticket;
                 this.waiter = waiter;
             }
-
-            public Node(int ticket, Object waiter, Node next) {
-                this.ticket = ticket;
-                this.waiter = waiter;
-                this.next = next;
-            }
-
 
             public boolean isMarked() {
                 return waiter == null;

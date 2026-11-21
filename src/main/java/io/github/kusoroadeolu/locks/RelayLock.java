@@ -199,9 +199,8 @@ public class RelayLock implements FairLock {
     }
 
 
-    //GC Based variant of the harris micheal linked list
-    //Uses fence hoisting to allow plain traversals as the fence synchronizes
-    //with volatile cas's that happen before the fence
+    //Variant of the harris micheal linked list
+    //See inline comment of ConcurrentSkipListMap for the details for manual fence hoisting
     static class WaitList {
         final Node head;
         final static Object DUMMY = new Object();
@@ -210,7 +209,7 @@ public class RelayLock implements FairLock {
             this.head = new Node(0, null);
         }
 
-        //null -> marked, dummy -> dumy
+        //null -> marked, dummy -> dummy
         public void add(int ticket) {
             Node node = new Node(ticket, Thread.currentThread());
             Node h = head;
@@ -221,10 +220,12 @@ public class RelayLock implements FairLock {
                 Node curr = h.next;
 
                 for (;;) {
-                    if (curr != null) {
-                        if (curr.isDummy()) continue outer;
 
-                        if (curr.isMarked()) {
+                    if (curr != null) {
+                        Object waiter = curr.waiter;
+                        if (waiter ==  DUMMY) continue outer;
+
+                        if (waiter == null) {
                             curr = helpUnlink(pred, curr);
                             continue;
                         }
@@ -233,11 +234,9 @@ public class RelayLock implements FairLock {
                    boolean enqueue = curr == null || curr.ticket > ticket;
 
                    if (enqueue) {
-
                        node.next = curr;
                        if (pred.casNext(curr, node)) return;
                        else curr = pred.next;
-                       //pred.next would be made visible by acquire barrier emitted on failed cas
                        continue;
                    }
 
@@ -256,20 +255,22 @@ public class RelayLock implements FairLock {
                 Node curr = h.next;
 
                 for (;;) {
+                    if (curr == null) return;
 
-                    if (curr != null) {
-                        if (curr.isDummy()) continue outer;
+                    Object waiter = curr.waiter;
 
-                        if (curr.isMarked()) {
-                            curr = helpUnlink(pred, curr);
-                            continue;
-                        }
+                    if (waiter ==  DUMMY) continue outer;
+
+                    if (waiter == null) {
+                        curr = helpUnlink(pred, curr);
+                        continue;
                     }
 
-                    boolean remove = curr != null && ticket == curr.ticket;
+
+                    boolean remove = ticket == curr.ticket;
 
                     if (remove) {
-                        curr.waiter = null;
+                        WAITER.setRelease(curr, null);
                         helpUnlink(pred, curr);
                         return;
                     }
@@ -287,16 +288,15 @@ public class RelayLock implements FairLock {
             for (;;) {
                 if (node == null || node.ticket > ticket) return null;
 
-                if (node.isDummy()) {
+                Object waiter = node.waiter;
+
+                if (waiter == DUMMY) {
                     node = node.next;
                     continue;
                 }
 
-
-
                 if (ticket == node.ticket)
-                    if (node.isMarked()) return null;
-                    else return (Thread) node.waiter;
+                    return (Thread) waiter;
 
 
                 node = node.next;
@@ -306,11 +306,13 @@ public class RelayLock implements FairLock {
         Node helpUnlink(Node pred, Node curr) {
             Node dummy = new Node(0, DUMMY);
             Node n;
+
             for (;;) {
                 n = curr.next;
                 dummy.next = n;
 
-                if (n != null && n.isDummy()) {
+
+                if (n != null && n.waiter != DUMMY) {
                     n = n.next; //get the dummy's next ptr
                     break;
                 } else if (curr.casNext(n, dummy))
@@ -332,25 +334,21 @@ public class RelayLock implements FairLock {
                 this.waiter = waiter;
             }
 
-            public boolean isMarked() {
-                return waiter == null;
-            }
-
             public boolean casNext(Node from, Node to) {
                 return NEXT.compareAndSet(this, from, to);
             }
 
-            public boolean isDummy() {
-                return waiter == DUMMY;
-            }
         }
 
 
         static final VarHandle NEXT;
+        static final VarHandle WAITER;
 
         static {
+            var l = MethodHandles.lookup();
             try {
-                NEXT = MethodHandles.lookup().findVarHandle(Node.class, "next", Node.class);
+                WAITER = l.findVarHandle(Node.class, "waiter", Object.class);
+                NEXT = l.findVarHandle(Node.class, "next", Node.class);
             }catch (Exception e) {
                 throw new RuntimeException(e);
             }

@@ -3,7 +3,6 @@ package io.github.kusoroadeolu.locks;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.locks.LockSupport;
-import java.util.concurrent.locks.StampedLock;
 
 class Pad0 {
     byte b1, b2, b3, b4;
@@ -55,6 +54,7 @@ class Pad1 extends ValueField {
 * is less than the time for the os to schedule a thread back onto
 * the cpu, the relay trick doesn't help much here.
 *
+*
 * My hypothesis going into this is that this should have around 1.5x to 2x less mean latency than a
 * fair reentrant lock, though much slower than a non-fair reentrant lock
 *
@@ -66,23 +66,28 @@ public class RelayLock implements FairLock {
     private final WaitList waitList;
     private final Slot[] waitQueue;
     private final int mask;
-    private static final int WAIT_QUEUE_LENGTH = Math.max(1, roundToPowerOfTwo(Runtime.getRuntime().availableProcessors()) / 2);
+    private static final int NCPU = Runtime.getRuntime().availableProcessors();
     private static final int SPINS_PER_YIELD = 1 << 6;
 
 
-    public RelayLock() {
-        waitQueue = new Slot[WAIT_QUEUE_LENGTH];
+    public RelayLock(int waitQueueLength) {
+        int wql = Math.max(1, roundToPowerOfTwo(waitQueueLength));
+        waitQueue = new Slot[wql];
         waitList = new WaitList();
         ticket = new Ticket();
         nowServing = new AtomicInt();
-        mask = WAIT_QUEUE_LENGTH - 1;
+        mask = wql - 1;
 
         VarHandle.releaseFence();
-        for (int i = 0; i < WAIT_QUEUE_LENGTH; ++i) {
+        for (int i = 0; i < wql; ++i) {
             waitQueue[i] = new Slot();
             if (i == 0) waitQueue[0].signal();
         }
         VarHandle.fullFence();
+    }
+
+    public RelayLock() {
+        this(NCPU / 2);
     }
 
     static class Ticket extends Pad1 {
@@ -255,7 +260,7 @@ public class RelayLock implements FairLock {
                 Node curr = h.next;
 
                 for (;;) {
-                    if (curr == null) return;
+                    if (curr == null) return; //shouldn't be possible
 
                     Object waiter = curr.waiter;
 

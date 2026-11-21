@@ -97,7 +97,7 @@ public class FairLockBench {
 
         @Setup(Level.Trial)
         public void setupLock() {
-            lock = type.equals("RelayLock") ? new RelayLock() : new FairReentrantLock();
+            lock = type.equals("RelayLock") ? new RelayLock() : new FairReentrantLock(); //Wrapper for JDK fair reentrant lock
         }
     }
 

@@ -13,8 +13,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 @State
 public class HandoffStressTest {
 
-    //We want to ensure sequential ordering after a volatile write for get
-    //And after a volatile read for enqueue
+    //We want to ensure sequential ordering after a volatile write for WaitList#get()
+    //And after a volatile read for WaitList#add()
+    //Forbidden (0 - 0), breaks seq consistency
     final AtomicInteger var = new AtomicInteger(0);
     final RelayLock.WaitList l = new RelayLock.WaitList();
 

@@ -93,6 +93,11 @@
     <profiles>
         <profile>
             <id>jcstress</id>
+            <properties>
+                <jcstress.mode>sanity</jcstress.mode>
+                <jcstress.forks>1</jcstress.forks>
+                <jcstress.test>io.github.kusoroadeolu.locks.*</jcstress.test>
+            </properties>
             <build>
                 <plugins>
                     <plugin>
@@ -114,11 +119,13 @@
                                         <classpath/>
                                         <argument>org.openjdk.jcstress.Main</argument>
                                         <argument>-m</argument>
-                                        <argument>sanity</argument>
+                                        <argument>${jcstress.mode}</argument>
+                                        <argument>-f</argument>
+                                        <argument>${jcstress.forks}</argument>
                                         <argument>-r</argument>
                                         <argument>target/jcstress-results</argument>
                                         <argument>-t</argument>
-                                        <argument>io.github.kusoroadeolu.locks.*</argument>
+                                        <argument>${jcstress.test}</argument>
                                     </arguments>
                                 </configuration>
                             </execution>

@@ -65,20 +65,19 @@ public class RelayLock implements FairLock {
     private final WaitList waitList;
     private final Slot[] waitQueue;
     private final int mask;
-    private static final int NCPU = roundToPowerOfTwo(Runtime.getRuntime().availableProcessors());
+    private static final int WAIT_QUEUE_LENGTH = Math.max(1, roundToPowerOfTwo(Runtime.getRuntime().availableProcessors()) / 2);
     private static final int SPINS_PER_YIELD = 1 << 5;
 
 
     public RelayLock() {
-        int queueLen = Math.max(1, NCPU / 2);
-        waitQueue = new Slot[queueLen];
+        waitQueue = new Slot[WAIT_QUEUE_LENGTH];
         waitList = new WaitList();
         ticket = new Ticket();
         nowServing = new AtomicInt();
-        mask = queueLen - 1;
+        mask = WAIT_QUEUE_LENGTH - 1;
 
         VarHandle.releaseFence();
-        for (int i = 0; i < queueLen; ++i) {
+        for (int i = 0; i < WAIT_QUEUE_LENGTH; ++i) {
             waitQueue[i] = new Slot();
             if (i == 0) waitQueue[0].signal();
         }
@@ -151,7 +150,7 @@ public class RelayLock implements FairLock {
             }else {
                 //check if we can acquire, enqueue, check if we can acquire, then park
                 if (!inMap) {
-                    waitList.enqueue(ourTicket);
+                    waitList.add(ourTicket);
                     inMap = true;
                 } else {
                     LockSupport.park();
@@ -170,6 +169,7 @@ public class RelayLock implements FairLock {
         Slot next = waitQueue[nextTicket & mask];
         nowServing.set(nextTicket);
         next.signal(); //handoff to next waiter
+        //could get reordered to happen before ticket.get, though not much of an issue
 
         int waiters = ticket.get() - ourTicket;
         if (waiters > (mask + 1)) {
@@ -210,7 +210,7 @@ public class RelayLock implements FairLock {
         }
 
         //null -> marked, dummy -> dumy
-        public void enqueue(int ticket) {
+        public void add(int ticket) {
             Node node = new Node(ticket, Thread.currentThread());
             Node h = head;
             outer: for (;;) {
@@ -255,6 +255,7 @@ public class RelayLock implements FairLock {
                 Node curr = h.next;
 
                 for (;;) {
+
                     if (curr != null) {
                         if (curr.isDummy()) continue outer;
 
@@ -290,8 +291,11 @@ public class RelayLock implements FairLock {
                     continue;
                 }
 
+
+
                 if (ticket == node.ticket)
-                    return (Thread) node.waiter;
+                    if (node.isMarked()) return null;
+                    else return (Thread) node.waiter;
 
 
                 node = node.next;

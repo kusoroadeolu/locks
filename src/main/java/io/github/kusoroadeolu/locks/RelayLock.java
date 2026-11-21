@@ -3,6 +3,7 @@ package io.github.kusoroadeolu.locks;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.StampedLock;
 
 class Pad0 {
     byte b1, b2, b3, b4;
@@ -66,7 +67,7 @@ public class RelayLock implements FairLock {
     private final Slot[] waitQueue;
     private final int mask;
     private static final int WAIT_QUEUE_LENGTH = Math.max(1, roundToPowerOfTwo(Runtime.getRuntime().availableProcessors()) / 2);
-    private static final int SPINS_PER_YIELD = 1 << 5;
+    private static final int SPINS_PER_YIELD = 1 << 6;
 
 
     public RelayLock() {
@@ -183,7 +184,7 @@ public class RelayLock implements FairLock {
 
     static void awaitTurn(Slot s) {
         for (int i = 0; !s.isNext();) {
-            if (i < SPINS_PER_YIELD) {
+            if  (i < SPINS_PER_YIELD) {
                 Thread.onSpinWait();
                 ++i;
             } else {

@@ -112,7 +112,6 @@ public class FairLockBench {
         @Setup(Level.Trial)
         public void setup() {
             data = new Data(lines);
-
         }
     }
 
@@ -162,7 +161,7 @@ public class FairLockBench {
         public static final String INITIAL_HEAP_SIZE = "-Xms4g";
         public static final String MAX_HEAP_SIZE = "-Xmx4g";
         public static final String GC_TYPE = "-XX:+UseG1GC";
-        public static final int[] THREAD_SWEEP = {6, 8 , 16, 24, 32, 48, 64};
+        public static final int[] THREAD_SWEEP = {6, 8,16, 24, 32, 48, 64};
 
     }
     //                            .addProfiler(JavaFlightRecorderProfiler.class, "dir=C:\\jfr-fc")

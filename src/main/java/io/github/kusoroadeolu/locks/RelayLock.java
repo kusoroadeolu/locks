@@ -30,42 +30,41 @@ class Pad1 extends ValueField {
 
 
 /*
-* A fair non-reentrant augmented ticket lock that tries to
-* hide scheduler bottlenecks and wakeup latency that plagues fair locks
-* by relaying wake-ups far earlier than they should occur.
-*
-* In a ticket lock, threads atomically claim tickets and wait on
-* a current serving field, until it equals their ticket before entering
-* some critical section. Here we augment it with a waiting queue/array to
-* so threads spin on some slot that corresponds to their ticket to improve locality
-* and a linked wait list to allow relayed unparks. Threads in the waiting queue
-* never park, however they spin briefly, periodically yielding their CPU time.
-* Threads that go in the wait list however park immediately.
-*
-* The main idea here is when a thread releases the lock, and there are parked threads
-* it can look ahead and wakeup a parked thread farther into the queue.
-* So by the time its turn arrives, it'd already be running on the CPU.
-*
-* The effectiveness of the relay trick does depend on 2 things
-* 1. The length of the critical section
-* 2. The max number of spinning waiters
-*
-* If the (time taken to exec the critical section * number of spinning waiters)
-* is less than the time for the os to schedule a thread back onto
-* the cpu, the relay trick doesn't help much here.
-*
-*
-* My hypothesis going into this is that this should have around 1.5x to 2x less mean latency than a
-* fair reentrant lock, though much slower than a non-fair reentrant lock
-*
-* */
+ * A fair non-reentrant augmented ticket lock that tries to
+ * hide scheduler bottlenecks and wakeup latency that plagues fair locks
+ * by relaying wake-ups far earlier than they should occur.
+ *
+ * In a ticket lock, threads atomically claim tickets and wait on
+ * a current serving field, until it equals their ticket before entering
+ * some critical section. Here we augment it with a waiting queue/array to
+ * so threads spin on some slot that corresponds to their ticket to improve locality
+ * and a linked wait list to allow relayed unparks. Threads in the waiting queue
+ * never park, however they spin briefly, periodically yielding their CPU time.
+ * Threads that go in the wait list however park immediately.
+ *
+ * The main idea here is when a thread releases the lock, and there are parked threads
+ * it can look ahead and wakeup a parked thread farther into the queue.
+ * So by the time its turn arrives, it'd already be running on the CPU.
+ *
+ * The effectiveness of the relay trick does depend on 2 things
+ * 1. The length of the critical section
+ * 2. The max number of spinning waiters
+ *
+ * If the (time taken to exec the critical section * number of spinning waiters)
+ * is less than the time for the os to schedule a thread back onto
+ * the cpu, the relay trick doesn't help much here.
+ *
+ * My hypothesis going into this is that this should have around 1.5x to 2x less mean latency than a
+ * fair reentrant lock, though much slower than a non-fair reentrant lock
+ *
+ * */
 public class RelayLock implements FairLock {
 
-    private final AtomicInt nowServing;
-    private final Ticket ticket;
-    private final WaitList waitList;
-    private final Slot[] waitQueue;
-    private final int mask;
+    final AtomicInt nowServing;
+    final Ticket ticket;
+    final WaitList waitList;
+    final Slot[] waitQueue;
+    final int mask;
     private static final int NCPU = Runtime.getRuntime().availableProcessors();
     private static final int SPINS_PER_YIELD = 1 << 6;
 
@@ -172,14 +171,17 @@ public class RelayLock implements FairLock {
         var ourTicket = nowServing.getPlain(); //our ticket
         var waitQueue = this.waitQueue;
         var nextTicket = ourTicket + 1;
+        int mask = this.mask;
+        int len = mask + 1;
+
         Slot next = waitQueue[nextTicket & mask];
         nowServing.set(nextTicket);
         next.signal(); //handoff to next waiter
-        //could get reordered to happen before ticket.get, though not much of an issue
 
         int waiters = ticket.get() - ourTicket;
-        if (waiters > (mask + 1)) {
-            int lookahead = ourTicket + (mask + 1);
+
+        if (waiters > len) {
+            int lookahead = ourTicket + len;
             Thread waiter = waitList.get(lookahead); //ties the ordering
             //lookahead the length of the queue to signal a farther waiter
             LockSupport.unpark(waiter);
@@ -205,7 +207,6 @@ public class RelayLock implements FairLock {
 
 
     //Variant of the harris micheal linked list
-    //See inline comment of ConcurrentSkipListMap for the details for manual fence hoisting
     static class WaitList {
         final Node head;
         final static Object DUMMY = new Object();
@@ -214,21 +215,22 @@ public class RelayLock implements FairLock {
             this.head = new Node(0, null);
         }
 
+        //Could manually hoist an acquire fence before each loop and use plain accesses for reads (once)
+        //Though not needed now
         //null -> marked, dummy -> dummy
         public void add(int ticket) {
             Node node = new Node(ticket, Thread.currentThread());
             Node h = head;
-            outer: for (;;) {
+            searchAgain: for (;;) {
 
-                VarHandle.acquireFence();
                 Node pred = h;
-                Node curr = h.next;
+                Node curr = h.nextAcquire();
 
                 for (;;) {
 
                     if (curr != null) {
-                        Object waiter = curr.waiter;
-                        if (waiter ==  DUMMY) continue outer;
+                        Object waiter = curr.waiterAcquire();
+                        if (waiter ==  DUMMY) continue searchAgain;
 
                         if (waiter == null) {
                             curr = helpUnlink(pred, curr);
@@ -236,16 +238,16 @@ public class RelayLock implements FairLock {
                         }
                     }
 
-                   boolean enqueue = curr == null || curr.ticket > ticket;
+                    boolean enqueue = curr == null || curr.ticket > ticket;
 
-                   if (enqueue) {
-                       node.next = curr;
-                       if (pred.casNext(curr, node)) return;
-                       else curr = pred.next;
-                       continue;
-                   }
+                    if (enqueue) {
+                        node.next = curr;
+                        if (pred.casNext(curr, node)) return;
+                        else curr = pred.next;
+                        continue;
+                    }
 
-                   pred = curr; curr = pred.next;
+                    pred = curr; curr = pred.nextAcquire();
                 }
             }
         }
@@ -253,18 +255,16 @@ public class RelayLock implements FairLock {
         //should always be present
         public void remove(int ticket) {
             Node h = head;
-            outer: for (;;) {
-
-                VarHandle.acquireFence();
+            searchAgain: for (;;) {
                 Node pred = h;
-                Node curr = h.next;
+                Node curr = h.nextAcquire();
 
                 for (;;) {
-                    if (curr == null) return; //shouldn't be possible
+                    if (curr == null) return;
 
-                    Object waiter = curr.waiter;
+                    Object waiter = curr.waiterAcquire();
 
-                    if (waiter ==  DUMMY) continue outer;
+                    if (waiter == DUMMY) continue searchAgain;
 
                     if (waiter == null) {
                         curr = helpUnlink(pred, curr);
@@ -280,23 +280,22 @@ public class RelayLock implements FairLock {
                         return;
                     }
 
-                    pred = curr; curr = pred.next;
+                    pred = curr; curr = pred.nextAcquire();
                 }
             }
         }
 
 
         public Thread get(int ticket) {
-            VarHandle.acquireFence();
-            Node node = head.next;
+            Node node = head.nextVolatile();
 
             for (;;) {
                 if (node == null || node.ticket > ticket) return null;
 
-                Object waiter = node.waiter;
+                Object waiter = node.waiterAcquire();
 
                 if (waiter == DUMMY) {
-                    node = node.next;
+                    node = node.nextVolatile();
                     continue;
                 }
 
@@ -304,7 +303,7 @@ public class RelayLock implements FairLock {
                     return (Thread) waiter;
 
 
-                node = node.next;
+                node = node.nextVolatile();
             }
         }
 
@@ -313,12 +312,13 @@ public class RelayLock implements FairLock {
             Node n;
 
             for (;;) {
-                n = curr.next;
+                n = curr.nextAcquire();
                 dummy.next = n;
 
 
-                if (n != null && n.waiter != DUMMY) {
-                    n = n.next; //get the dummy's next ptr
+                if (n != null && n.waiter == DUMMY) {
+                    n = n.nextAcquire(); //get the dummy's next ptr
+                    //could possibly use a plain read here
                     break;
                 } else if (curr.casNext(n, dummy))
                     break; //emits an acquire fence, allows later reads to synchronize with this
@@ -341,6 +341,18 @@ public class RelayLock implements FairLock {
 
             public boolean casNext(Node from, Node to) {
                 return NEXT.compareAndSet(this, from, to);
+            }
+
+            public Node nextAcquire() {
+                return (Node) NEXT.getAcquire(this);
+            }
+
+            public Node nextVolatile() {
+                return (Node) NEXT.getAcquire(this);
+            }
+
+            public Object waiterAcquire() {
+                return WAITER.getAcquire(this);
             }
 
         }

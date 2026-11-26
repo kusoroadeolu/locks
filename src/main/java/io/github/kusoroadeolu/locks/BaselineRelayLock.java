@@ -8,7 +8,7 @@ public class BaselineRelayLock extends RelayLock{
     @Override
     public void unlock() {
         var ourTicket = nowServing.getPlain(); //our ticket
-        var waitQueue = this.waitQueue;
+        var waitQueue = this.spinArray;
         var nextTicket = ourTicket + 1;
         int mask = this.mask;
 

@@ -46,7 +46,7 @@ class Pad1 extends ValueField {
  * it can look ahead and wakeup a parked thread farther into the queue.
  * So by the time its turn arrives, it'd already be running on the CPU.
  *
- * The effectiveness of the relay trick does depend on 2 things
+ * I believe effectiveness of the relay trick does depend on 2 things
  * 1. The length of the critical section
  * 2. The max number of spinning waiters
  *
@@ -54,24 +54,23 @@ class Pad1 extends ValueField {
  * is less than the time for the os to schedule a thread back onto
  * the cpu, the relay trick doesn't help much here.
  *
- * My hypothesis going into this is that this should have around 1.5x to 2x less mean latency than a
- * fair reentrant lock, though much slower than a non-fair reentrant lock
- *
+ * I still expect lock handoff to dominate critical section cost
+ *just not as bad as other fair locks
  * */
 public class RelayLock implements FairLock {
 
     final AtomicInt nowServing;
     final Ticket ticket;
     final WaitList waitList;
-    final Slot[] waitQueue;
+    final Slot[] spinArray;
     final int mask;
     private static final int NCPU = Runtime.getRuntime().availableProcessors();
     private static final int SPINS_PER_YIELD = 1 << 6;
 
 
-    public RelayLock(int waitQueueLength) {
-        int wql = Math.max(1, roundToPowerOfTwo(waitQueueLength));
-        waitQueue = new Slot[wql];
+    public RelayLock(int spinArrayLength) {
+        int wql = Math.max(1, roundToPowerOfTwo(spinArrayLength));
+        spinArray = new Slot[wql];
         waitList = new WaitList();
         ticket = new Ticket();
         nowServing = new AtomicInt();
@@ -79,8 +78,8 @@ public class RelayLock implements FairLock {
 
         VarHandle.releaseFence();
         for (int i = 0; i < wql; ++i) {
-            waitQueue[i] = new Slot();
-            if (i == 0) waitQueue[0].signal();
+            spinArray[i] = new Slot();
+            if (i == 0) spinArray[0].signal();
         }
         VarHandle.fullFence();
     }
@@ -103,7 +102,7 @@ public class RelayLock implements FairLock {
 
         static final int NEXT = 1;
 
-        public boolean isNext() {
+        public boolean isSignalled() {
             return (int) VALUE.getAcquire(this) == NEXT;
         }
 
@@ -133,32 +132,33 @@ public class RelayLock implements FairLock {
     @Override
     public void lock() {
         int ourTicket = ticket.nextTicket();
-        var waitQueue = this.waitQueue;
+        var spinArray = this.spinArray;
         int mask = this.mask;
         var waitList = this.waitList;
 
         int len = mask + 1;
-        boolean inMap = false;
+        boolean parking = false;
         for (;;) {
             int nowServing = this.nowServing.get();
-            if ((ourTicket - nowServing) < len) {
+            boolean inSpinWindow = (ourTicket - nowServing) < len;
+            if (inSpinWindow) {
 
-                if (inMap)
+                if (parking)
                     waitList.remove(ourTicket);
 
                 int index = ourTicket & mask;
-                Slot s = waitQueue[index];
+                Slot s = spinArray[index];
                 awaitTurn(s);
                 s.clearState();
                 return;
 
             }else {
                 //check if we can acquire, enqueue, check if we can acquire, then park
-                if (!inMap) {
+                if (!parking) {
                     waitList.add(ourTicket);
-                    inMap = true;
+                    parking = true;
                 } else {
-                    LockSupport.park();
+                    LockSupport.park(this);
                 }
 
             }
@@ -168,29 +168,25 @@ public class RelayLock implements FairLock {
 
     @Override
     public void unlock() {
-        var ourTicket = nowServing.getPlain(); //our ticket
-        var waitQueue = this.waitQueue;
-        var nextTicket = ourTicket + 1;
+        int ourTicket = nowServing.getPlain(); //our ticket
+        var spinArray = this.spinArray;
+        int nextTicket = ourTicket + 1;
         int mask = this.mask;
         int len = mask + 1;
 
-        Slot next = waitQueue[nextTicket & mask];
+        Slot next = spinArray[nextTicket & mask];
         nowServing.set(nextTicket);
         next.signal(); //handoff to next waiter
 
-        int waiters = ticket.get() - ourTicket;
-
-        if (waiters > len) {
-            int lookahead = ourTicket + len;
-            Thread waiter = waitList.get(lookahead); //ties the ordering
-            //lookahead the length of the queue to signal a farther waiter
-            LockSupport.unpark(waiter);
-        }
+        int lookahead = ourTicket + len;
+        Thread waiter = waitList.get(lookahead); //ties the ordering
+        //lookahead the length of the queue to signal a farther waiter
+        LockSupport.unpark(waiter);
 
     }
 
     static void awaitTurn(Slot s) {
-        for (int i = 0; !s.isNext();) {
+        for (int i = 0; !s.isSignalled();) {
             if  (i < SPINS_PER_YIELD) {
                 Thread.onSpinWait();
                 ++i;
@@ -221,7 +217,7 @@ public class RelayLock implements FairLock {
         public void add(int ticket) {
             Node node = new Node(ticket, Thread.currentThread());
             Node h = head;
-            searchAgain: for (;;) {
+            restartFromHead: for (;;) {
 
                 Node pred = h;
                 Node curr = h.nextAcquire();
@@ -230,7 +226,8 @@ public class RelayLock implements FairLock {
 
                     if (curr != null) {
                         Object waiter = curr.waiterAcquire();
-                        if (waiter ==  DUMMY) continue searchAgain;
+
+                        if (waiter == DUMMY) continue restartFromHead;
 
                         if (waiter == null) {
                             curr = helpUnlink(pred, curr);
@@ -255,16 +252,14 @@ public class RelayLock implements FairLock {
         //should always be present
         public void remove(int ticket) {
             Node h = head;
-            searchAgain: for (;;) {
+            restartFromHead: for (;;) {
                 Node pred = h;
                 Node curr = h.nextAcquire();
 
                 for (;;) {
-                    if (curr == null) return;
-
                     Object waiter = curr.waiterAcquire();
 
-                    if (waiter == DUMMY) continue searchAgain;
+                    if (waiter == DUMMY) continue restartFromHead;
 
                     if (waiter == null) {
                         curr = helpUnlink(pred, curr);
@@ -292,7 +287,7 @@ public class RelayLock implements FairLock {
             for (;;) {
                 if (node == null || node.ticket > ticket) return null;
 
-                Object waiter = node.waiterAcquire();
+                Object waiter = node.waiter;
 
                 if (waiter == DUMMY) {
                     node = node.nextVolatile();

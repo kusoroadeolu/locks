@@ -178,10 +178,14 @@ public class RelayLock implements FairLock {
         nowServing.set(nextTicket);
         next.signal(); //handoff to next waiter
 
-        int lookahead = ourTicket + len;
-        Thread waiter = waitList.get(lookahead); //ties the ordering
-        //lookahead the length of the queue to signal a farther waiter
-        LockSupport.unpark(waiter);
+        int waiters = ticket.get() - ourTicket;
+
+        if (waiters > len) {
+            int lookahead = ourTicket + len;
+            Thread waiter = waitList.get(lookahead); //ties the ordering
+            //lookahead the length of the queue to signal a farther waiter
+            LockSupport.unpark(waiter);
+        }
 
     }
 

@@ -39,5 +39,5 @@ public class HandoffStressTest {
 }
 
 /*
-* mvn clean test -Pjcstress -DskipTests "-Djcstress.mode=tough" "-Djcstress.forks=3" "-Djcstress.test=.*HandoffStressTest"
+* mvn clean test -Pjcstress "-Djcstress.mode=tough" "-Djcstress.forks=3" "-Djcstress.test=.*HandoffStressTest"
 * */

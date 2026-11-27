@@ -13,7 +13,6 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.github.kusoroadeolu.locks.benchmarks.FairLockBench.Args;
 
@@ -23,6 +22,26 @@ import static io.github.kusoroadeolu.locks.benchmarks.FairLockBench.Args;
 @BenchmarkMode(Mode.SampleTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 public class FairLockBench {
+
+    static final class Data {
+        static final int STRIDE = 16; // 16 longs = 128 bytes, should dodge intels adjacent-line prefetch, we could make this 8 though
+        static final int PAD = 12;    // we keep the first counter away from the array header, is this necessary though? could remove this later on
+        final long[] x;
+        final int lines;
+
+        Data(int lines) {
+            this.lines = lines;
+            this.x = new long[PAD + lines * STRIDE];
+        }
+
+        long add() {
+            long old = x[PAD];
+            for (int i = 0; i < lines; i++) {
+                x[PAD + i * STRIDE] = old + 1;
+            }
+            return old;
+        }
+    }
 
     static final class HeapData {
         static final int DELTA_MASK = (1 << 20) - 1;
@@ -68,9 +87,12 @@ public class FairLockBench {
 
     @State(Scope.Benchmark)
     public static class BaseState {
-        @Param({"RelayLock", "BaselineRelayLock", "ReentrantLock"})
+        @Param({"RelayLock", "ReentrantLock", "BaselineRelayLock"})
         public String type;
         FairLock lock;
+
+        @Param({"100"})
+        public int work;
 
         @Setup(Level.Trial)
         public void setupLock() {
@@ -84,10 +106,22 @@ public class FairLockBench {
     }
 
 
+    @State(Scope.Benchmark)
+    public static class CacheLineLockState extends BaseState {
+        @Param({"5"})
+        public int lines;
+
+        Data data;
+
+        @Setup(Level.Trial)
+        public void setup() {
+            data = new Data(lines);
+        }
+    }
 
     @State(Scope.Benchmark)
     public static class HeapLockState extends BaseState {
-        @Param({"65536"})
+        @Param({"65536"})   // 512 KB of longs
         public int size;
 
         HeapData data;
@@ -99,6 +133,19 @@ public class FairLockBench {
     }
 
     @Benchmark
+    public long add(CacheLineLockState s) {
+        long r;
+        s.lock.lock();
+        try {
+            r = s.data.add();
+        } finally {
+            s.lock.unlock();
+        }
+        Blackhole.consumeCPU(s.work);
+        return r;
+    }
+
+    @Benchmark
     public long hold(HeapLockState s) {
         long r;
         s.lock.lock();
@@ -107,6 +154,7 @@ public class FairLockBench {
         } finally {
             s.lock.unlock();
         }
+        Blackhole.consumeCPU(s.work);
         return r;
     }
 
@@ -117,16 +165,16 @@ public class FairLockBench {
         public static final String INITIAL_HEAP_SIZE = "-Xms4g";
         public static final String MAX_HEAP_SIZE = "-Xmx4g";
         public static final String GC_TYPE = "-XX:+UseG1GC";
-        public static final int[] THREAD_SWEEP = {6, 8,16, 24, 32, 48, 64};
+        public static final int[] THREAD_SWEEP = {6,16, 24, 32, 48, 64};
 
     }
     //                            .addProfiler(JavaFlightRecorderProfiler.class, "dir=C:\\jfr-fc")
 
     static void main(String[] args) throws Exception {
-        int cores = Runtime.getRuntime().availableProcessors();
+        int cpus = Runtime.getRuntime().availableProcessors();
         Files.createDirectories(Path.of("target/jmh-results"));
         for (int t : Args.THREAD_SWEEP) {
-            if (t > cores) break;
+            if (t > cpus) break;
             new Runner(
                     new OptionsBuilder()
                             .include(FairLockBench.class.getSimpleName())
@@ -143,14 +191,3 @@ public class FairLockBench {
 mvn clean test -Pjmh
 * */
 
-/* intel i5 4 core 8 cpu Windows
-
-| Threads | Bench | Lock              | Score (ns/op)    | P00      | P50     | P90     | P95     | P99     | P99.9   | P99.99    | P99.999   | Max       |
-|---------|-------|-------------------|------------------|----------|---------|---------|---------|---------|---------|-----------|-----------|-----------|
-| 6       | hold  | RelayLock         | 18,728.0 ± 27.7  | 400.0    | 18,080.0 | 25,696.0 | 26,272.0 | 28,672.0 | 49,280.0 | 700,416.0 | 1,368,965.0 | 1,685,504.0 |
-| 6       | hold  | ReentrantLock     | 37,762.0 ± 35.4  | 20,800.0 | 37,696.0 | 42,752.0 | 44,800.0 | 51,456.0 | 76,288.0 | 713,728.0 | 1,231,064.9 | 1,812,480.0 |
-| 6       | hold  | BaselineRelayLock | 38,156.2 ± 33.4  | 8,592.0  | 38,656.0 | 43,840.0 | 45,568.0 | 52,544.0 | 74,496.0 | 716,079.4 | 1,012,736.0 | 1,267,712.0 |
-| 8       | hold  | RelayLock         | 26,740.8 ± 27.3  | 500.0    | 26,176.0 | 28,192.0 | 29,280.0 | 35,968.0 | 74,880.0 | 715,776.0 | 997,376.0   | 1,198,080.0 |
-| 8       | hold  | ReentrantLock     | 49,470.7 ± 30.4  | 30,880.0 | 48,768.0 | 54,848.0 | 56,896.0 | 63,744.0 | 81,920.0 | 728,064.0 | 1,012,396.1 | 2,654,208.0 |
-| 8       | hold  | BaselineRelayLock | 51,024.3 ± 29.0  | 8,688.0  | 50,368.0 | 57,792.0 | 60,480.0 | 68,992.0 | 93,952.0 | 729,088.0 | 1,010,688.0 | 1,566,720.0 |
-*/
